@@ -107,7 +107,7 @@ class Net {
     this.sendT = 0;
     this.connected = false;
     this.colIdx = Math.floor(Math.random() * JACKETS.length);
-    this.room = (location.hash.match(/room=([a-zA-Z0-9_-]{1,24})/) || [])[1] || ('mountain-' + SEED);
+    this.room = (location.hash.match(/room=([a-zA-Z0-9_-]{1,24})/) || [])[1] || 'geths-flowline';
     this.connect();
   }
   connect() {
