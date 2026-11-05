@@ -1,0 +1,141 @@
+--- Transfer.html
++++ Flowline-Canva-Live-Leaderboard.html
+@@ -409,7 +409,7 @@
+      <h2>RIDER RADIO <button id="refreshRadio" class="canva-button" type="button" aria-label="Refresh shared radio and leaderboard" style="float:right;border:1px solid #ffffff55;border-radius:6px;background:#102b40;color:white;padding:2px 6px;cursor:pointer">REFRESH</button></h2>
+      <div id="chatLog" class="canva-list" role="log" aria-live="polite" aria-relevant="additions"></div>
+      <form id="chatForm"><label for="chatInput" class="sr-only">Message other riders</label><input id="chatInput" class="canva-input" maxlength="180" placeholder="Say something…" autocomplete="off"><button id="chatSend" class="canva-button" type="submit">SEND</button>
+-     </form><button id="postScore" class="canva-button" type="button" style="margin-top:7px;padding:6px 9px;border:1px solid #ffffff55;border-radius:8px;background:#102b40;color:white;cursor:pointer">SHARE MY DISTANCE</button>
++     </form>
+      <div id="chatStatus" role="status">
+       Drop in to read shared messages and lines.
+      </div>
+@@ -11620,6 +11620,18 @@
+     this.connected = false;
+     this.colIdx = Math.floor(Math.random() * JACKETS.length);
+     this.room = (location.hash.match(/room=([a-zA-Z0-9_-]{1,24})/) || [])[1] || 'geths-flowline';
++    this.playerId = LS.get('scorePlayerId', '');
++    if (!this.playerId) {
++      this.playerId = 'rider-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
++      LS.set('scorePlayerId', this.playerId);
++    }
++    this.scoreRecord = null;
++    this.scoreCreatePending = false;
++    this.scoreWriteInFlight = false;
++    this.pendingScore = null;
++    this.scoreTimer = setInterval(() => {
++      if (G.started && !G.paused && G.rider && G.rider.state === 'ride') this.submit(G.rider.dist, false);
++    }, 10000);
+     this.connect();
+   }
+   // Shared radio and leaderboard behavior is implemented below using the Canva Sheet.
+@@ -11632,6 +11644,10 @@
+   const handler = { onDataChanged: rows => {
+     clearTimeout(this.loadTimer);
+     this.records = rows;
++    this.scoreRecord = rows.find(r => r.kind === 'score' && r.player_id === this.playerId)
++      || rows.find(r => r.kind === 'score' && !r.player_id && String(r.name || '') === this.name)
++      || null;
++    if (this.scoreRecord) this.scoreCreatePending = false;
+     this.connected = true;
+     UI.net(true);
+     $('chatStatus').textContent = rows.length >= 990 ? 'Shared radio nearly full (999 messages maximum)' : 'Shared via Canva Sheet · updates may take a moment';
+@@ -11651,8 +11667,11 @@
+     }
+     log.scrollTop = log.scrollHeight;
+     const scores = rows.filter(r => r.kind === 'score').sort((a,b) => (+b.distance || 0) - (+a.distance || 0));
+-    const unique = [], names = new Set();
+-    for (const r of scores) if (!names.has(r.name)) { names.add(r.name); unique.push({n:r.name,d:r.distance}); }
++    const unique = [], players = new Set();
++    for (const r of scores) {
++      const key = r.player_id || String(r.name || 'rider');
++      if (!players.has(key)) { players.add(key); unique.push({n:r.name,d:r.distance}); }
++    }
+     UI.allTime(unique.slice(0,8));
+   }};
+   this.loadTimer = setTimeout(() => { if (!this.connected) $('chatStatus').textContent = 'Could not load shared radio. Tap here to retry.'; }, 8000);
+@@ -11675,15 +11694,64 @@
+   for (const r of scores) { const n = String(r.name || 'rider').slice(0,12); if (!names.has(n)) { names.add(n); list.push({n,d:+r.distance || 0,col:0x8fd0ff}); } }
+   return list.sort((a,b) => b.d - a.d);
+ };
+-Net.prototype.wipeout = function () {};
+-Net.prototype.submit = async function (distance) {
++Net.prototype.wipeout = function () {
++  // Capture the final distance before the rider resets at the top of the mountain.
++  this.submit(G.rider ? G.rider.dist : 0, true);
++};
++Net.prototype.submit = async function (distance, final = false) {
+   distance = Math.round(distance);
+   if (distance < 150 || !this.connected) return;
+-  if ((this.records || []).length >= 999) { $('chatStatus').textContent = 'Shared radio is full (999 entries).'; return; }
++  if (this.scoreWriteInFlight) {
++    // Preserve the latest/final distance if a previous 10-second write is still running.
++    this.pendingScore = { distance, final: !!(final || (this.pendingScore && this.pendingScore.final)) };
++    return;
++  }
++  const existing = this.scoreRecord
++    || (this.records || []).find(r => r.kind === 'score' && r.player_id === this.playerId)
++    || (this.records || []).find(r => r.kind === 'score' && !r.player_id && String(r.name || '') === this.name);
++  if (!existing && this.scoreCreatePending) return;
++  if (!existing && (this.records || []).length >= 999) {
++    $('chatStatus').textContent = 'Shared radio is full (999 entries).';
++    return;
++  }
++  const now = new Date().toISOString();
++  const data = {
++    kind: 'score', player_id: this.playerId, name: this.name, text: '', distance,
++    created_at: existing && existing.created_at ? existing.created_at : now,
++    updated_at: now
++  };
++  this.scoreWriteInFlight = true;
+   try {
+-    const result = await window.dataSdk.create({kind:'score',name:this.name,text:'',distance,created_at:new Date().toISOString()});
+-    $('chatStatus').textContent = result.isOk ? 'Line saved to shared leaderboard.' : 'Could not confirm score. Refresh before trying again.';
+-  } catch (_) { $('chatStatus').textContent = 'Could not confirm score. Refresh before trying again.'; }
++    const result = existing
++      ? await window.dataSdk.update({ ...existing, ...data })
++      : await window.dataSdk.create(data);
++    if (result.isOk) {
++      if (existing) this.scoreRecord = { ...existing, ...data };
++      else {
++        this.scoreCreatePending = !this.scoreRecord;
++        if (result.data && result.data.__backendId) {
++          this.scoreRecord = { ...data, ...result.data };
++          this.scoreCreatePending = false;
++        }
++      }
++      $('chatStatus').textContent = final
++        ? 'Final line saved to the shared leaderboard.'
++        : 'Live distance updated · shared leaderboard';
++    } else {
++      $('chatStatus').textContent = 'Could not update the shared leaderboard. Will retry.';
++      if (!existing) this.scoreCreatePending = false;
++    }
++  } catch (_) {
++    $('chatStatus').textContent = 'Could not update the shared leaderboard. Will retry.';
++    if (!existing) this.scoreCreatePending = false;
++  } finally {
++    this.scoreWriteInFlight = false;
++    if (this.pendingScore) {
++      const pending = this.pendingScore;
++      this.pendingScore = null;
++      this.submit(pending.distance, pending.final);
++    }
++  }
+ };
+ Net.prototype.postChat = async function (text, button) {
+   if (!this.connected) { $('chatStatus').textContent = 'Shared radio is not ready. Tap status to retry.'; return false; }
+@@ -12151,14 +12219,6 @@
+       if (input.value.trim() === text) input.value = '';
+     }
+   });
+-  $('postScore').onclick = async e => {
+-    if (!G.net || !G.net.connected) { $('chatStatus').textContent = 'Shared radio is not ready yet.'; return; }
+-    const distance = Math.round(G.rider.dist);
+-    if (distance < 150) { $('chatStatus').textContent = 'Ride at least 150m before sharing a line.'; return; }
+-    const button = e.currentTarget;
+-    button.disabled = true; button.textContent = 'SHARING…';
+-    try { await G.net.submit(distance); } finally { button.disabled = false; button.textContent = 'SHARE MY DISTANCE'; }
+-  };
+   // --- start
+   const nameIn = $('nameIn');
+   nameIn.value = LS.get('name', '') || '';
